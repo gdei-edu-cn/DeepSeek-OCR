@@ -17,8 +17,9 @@ model = model.eval().cuda().to(torch.bfloat16)
 
 # prompt = "<image>\nFree OCR. "
 prompt = "<image>\n<|grounding|>Convert the document to markdown. "
-image_file = 'your_image.jpg'
-output_path = 'your/output/dir'
+# 这里要修改为要测试的图片路径
+image_file = '../../assets/show1.jpg'
+output_path = '../../output_hf'
 
 
 
