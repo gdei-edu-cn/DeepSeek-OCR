@@ -1,137 +1,146 @@
 #!/usr/bin/env python3
-# 批量评测脚本 - 用于Fox数据集Tiny/Small两档评测
-import os
-import sys
-import argparse
-import json
+# -*- coding: utf-8 -*-
+# 批量评测脚本 - Tiny(64)/Small(100) 两档；离线优先；逐条落盘
+import os, sys, json, time, argparse
 from pathlib import Path
-from transformers import AutoModel, AutoTokenizer
 import torch
+from transformers import AutoModel, AutoTokenizer
 from PIL import Image
-import time
+
+TORCH_DTYPE = torch.bfloat16
+PROMPT_DEFAULT = "Free OCR."
+
+def _normalize(out):
+    if isinstance(out, str):
+        return out.strip()
+    if isinstance(out, dict):
+        # 常见字段兜底
+        return (out.get("text") or out.get("generated_text") or out.get("answer") or "").strip()
+    if isinstance(out, list) and out:
+        o = out[0]
+        if isinstance(o, str):  return o.strip()
+        if isinstance(o, dict): return (o.get("text") or o.get("generated_text") or "").strip()
+    return ""
 
 def setup_model():
-    """加载DeepSeek-OCR模型"""
-    model_name = 'deepseek-ai/DeepSeek-OCR'
-    print(f"加载模型: {model_name}")
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    """加载DeepSeek-OCR模型 - 离线优先"""
+    model_id = os.getenv("DEEPSEEK_OCR_HF", "deepseek-ai/DeepSeek-OCR")
+    local_only = os.path.isdir(model_id) or os.getenv("HF_HUB_OFFLINE", "") == "1"
+    print(f"加载模型: {model_id} (离线={local_only})")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, local_files_only=local_only)
     model = AutoModel.from_pretrained(
-        model_name, 
-        _attn_implementation='flash_attention_2', 
-        trust_remote_code=True, 
-        use_safetensors=True
-    )
-    model = model.eval().cuda().to(torch.bfloat16)
-    
+        model_id,
+        trust_remote_code=True,
+        local_files_only=local_only,
+        use_safetensors=True,
+        torch_dtype=TORCH_DTYPE,
+        # 如果 flash-attn2 报 dtype/环境错误，直接去掉这一行
+        _attn_implementation=os.getenv("DSK_FLASH", "flash_attention_2"),
+    ).eval().to("cuda")
     return model, tokenizer
 
-def process_image(model, tokenizer, image_path, prompt, base_size, image_size, crop_mode):
-    """处理单张图像"""
-    try:
-        result = model.infer(
-            tokenizer, 
-            prompt=prompt, 
-            image_file=str(image_path), 
-            output_path="/tmp",  # 临时输出目录
-            base_size=base_size, 
-            image_size=image_size, 
-            crop_mode=crop_mode, 
-            save_results=False, 
-            test_compress=False
-        )
-        return result
-    except Exception as e:
-        print(f"处理图像 {image_path} 时出错: {e}")
-        return None
 
 def batch_evaluate(input_dir, output_dir, mode, image_size, prompt, temperature=0, top_p=1):
-    """批量评测函数"""
+    """批量评测函数 - 离线优先，逐条落盘"""
     print(f"开始批量评测: {mode} 模式, 图像尺寸: {image_size}x{image_size}")
     print(f"输入目录: {input_dir}")
     print(f"输出目录: {output_dir}")
     print(f"提示词: {prompt}")
     
-    # 设置参数
+    # 设置参数（保留以兼容，但实际由 model.chat 内部处理）
     if mode == "tiny":
         base_size = 512
-        crop_mode = False
     elif mode == "small":
         base_size = 640
-        crop_mode = False
     else:
         raise ValueError(f"不支持的模式: {mode}")
     
-    # 创建输出目录
+    # 创建输出目录和结果文件
     os.makedirs(output_dir, exist_ok=True)
+    preds_path = Path(output_dir) / "preds.jsonl"
+    if preds_path.exists():
+        preds_path.unlink()  # 清空旧结果
     
     # 加载模型
     model, tokenizer = setup_model()
     
     # 获取所有图像文件
-    input_path = Path(input_dir)
-    image_files = list(input_path.glob("*.png")) + list(input_path.glob("*.jpg"))
-    print(f"找到 {len(image_files)} 个图像文件")
+    img_dir = Path(input_dir)
+    imgs = sorted([p for p in img_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"}])
+    print(f"找到 {len(imgs)} 个图像文件")
     
-    # 批量处理
-    results = []
+    # 批量处理 - 逐条落盘
     start_time = time.time()
     
-    for i, image_file in enumerate(image_files):
-        print(f"处理 {i+1}/{len(image_files)}: {image_file.name}")
-        
-        result = process_image(
-            model, tokenizer, image_file, prompt, 
-            base_size, image_size, crop_mode
-        )
-        
-        if result:
-            results.append({
-                "image": image_file.name,
-                "result": result,
-                "mode": mode,
-                "image_size": image_size,
-                "base_size": base_size,
-                "crop_mode": crop_mode,
-                "prompt": prompt
-            })
+    with torch.no_grad(), open(preds_path, "a", encoding="utf-8") as fout:
+        for i, img in enumerate(imgs, 1):
+            print(f"处理 {i}/{len(imgs)}: {img.name}")
+            try:
+                # 1) 直接跑 infer，拿"返回值"
+                out = model.infer(
+                    tokenizer,
+                    prompt=prompt,
+                    image_file=str(img),
+                    output_path=str(preds_path.parent / "output_hf"),  # 给它一个固定可写目录
+                    base_size=base_size,
+                    image_size=image_size,
+                    crop_mode=False,
+                    save_results=True,
+                    test_compress=False
+                )
+
+                # 2) 先用返回值；为空再兜底去读可能的 result.mmd
+                pred_text = _normalize(out)
+
+                if not pred_text:
+                    candidates = [
+                        Path(preds_path.parent) / "output_hf" / "result.mmd",
+                        Path(preds_path.parent) / "output"    / "result.mmd",
+                        Path("output_hf") / "result.mmd",
+                        Path("output")    / "result.mmd",
+                    ]
+                    for c in candidates:
+                        if c.exists():
+                            pred_text = c.read_text(encoding="utf-8").strip()
+                            break
+
+                if not pred_text:
+                    pred_text = ""  # 不要写 "None"，空串即可
+
+                # 3) 写盘
+                print(pred_text[:120])  # 抽查
+                rec = {"image": img.name, "pred": pred_text}
+
+            except Exception as e:
+                import traceback
+                print(f"处理图像 {img.name} 时出错: {e}")
+                rec = {"image": img.name, "pred": "", "error": traceback.format_exc()}
+
+            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fout.flush()
+            os.fsync(fout.fileno())
     
-    # 保存结果
-    output_file = Path(output_dir) / f"fox_{mode}_{image_size}_results.json"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    
-    end_time = time.time()
+    dur = time.time() - start_time
     print(f"评测完成!")
-    print(f"处理了 {len(results)} 个文件")
-    print(f"耗时: {end_time - start_time:.2f} 秒")
-    print(f"结果保存到: {output_file}")
+    print(f"处理了 {len(imgs)} 个文件")
+    print(f"耗时: {dur:.2f} 秒")
+    print(f"结果保存到: {preds_path}")
 
 def main():
     parser = argparse.ArgumentParser(description="DeepSeek-OCR Fox数据集批量评测")
-    parser.add_argument("--input_dir", required=True, help="输入图像目录")
-    parser.add_argument("--output", required=True, help="输出目录")
-    parser.add_argument("--mode", choices=["tiny", "small"], required=True, help="评测模式")
-    parser.add_argument("--image_size", type=int, required=True, help="图像尺寸")
-    parser.add_argument("--prompt", default="Free OCR.", help="提示词")
-    parser.add_argument("--temperature", type=float, default=0, help="温度参数")
-    parser.add_argument("--top_p", type=float, default=1, help="top_p参数")
-    
+    parser.add_argument("--input_dir", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--mode", choices=["tiny", "small"], required=True)
+    parser.add_argument("--image_size", type=int, required=True)
+    parser.add_argument("--prompt", default=PROMPT_DEFAULT)
+    parser.add_argument("--temperature", type=float, default=0)
+    parser.add_argument("--top_p", type=float, default=1)
     args = parser.parse_args()
-    
-    # 设置CUDA设备
-    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
-    
-    # 运行批量评测
-    batch_evaluate(
-        args.input_dir, 
-        args.output, 
-        args.mode, 
-        args.image_size, 
-        args.prompt, 
-        args.temperature, 
-        args.top_p
-    )
+
+    # 不要在这里改 CUDA_VISIBLE_DEVICES；用你外面 export 的
+    batch_evaluate(args.input_dir, args.output, args.mode, args.image_size,
+                   args.prompt, args.temperature, args.top_p)
 
 if __name__ == "__main__":
     main()
