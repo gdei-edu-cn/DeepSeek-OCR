@@ -1,0 +1,47 @@
+# 数据集 - 绝对不能推送！
+/Fox/
+/OmniDocBench/
+
+# 输出结果
+/output/
+/output_hf/
+/runs/
+
+# 生成的文件
+*.jpg
+*.png
+*.mmd
+*.json
+*.pkl
+*.pt
+*.bin
+
+# 缓存和临时文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志文件
+*.log
+logs/
+
+# 大型数据文件
+*.h5
+*.hdf5
+*.feather
+*.parquet
+
