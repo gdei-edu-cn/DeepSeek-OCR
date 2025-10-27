@@ -77,41 +77,22 @@ def batch_evaluate(input_dir, output_dir, mode, image_size, prompt, temperature=
         for i, img in enumerate(imgs, 1):
             print(f"处理 {i}/{len(imgs)}: {img.name}")
             try:
-                # 1) 直接跑 infer，拿"返回值"
                 out = model.infer(
                     tokenizer,
                     prompt=prompt,
                     image_file=str(img),
-                    output_path=str(preds_path.parent / "output_hf"),  # 给它一个固定可写目录
                     base_size=base_size,
                     image_size=image_size,
                     crop_mode=False,
-                    save_results=True,
+                    save_results=False,   # 直接用返回值，不落盘
                     test_compress=False
                 )
-
-                # 2) 先用返回值；为空再兜底去读可能的 result.mmd
-                pred_text = _normalize(out)
-
+                pred_text = (out or "").strip()
                 if not pred_text:
-                    candidates = [
-                        Path(preds_path.parent) / "output_hf" / "result.mmd",
-                        Path(preds_path.parent) / "output"    / "result.mmd",
-                        Path("output_hf") / "result.mmd",
-                        Path("output")    / "result.mmd",
-                    ]
-                    for c in candidates:
-                        if c.exists():
-                            pred_text = c.read_text(encoding="utf-8").strip()
-                            break
-
-                if not pred_text:
-                    pred_text = ""  # 不要写 "None"，空串即可
-
-                # 3) 写盘
-                print(pred_text[:120])  # 抽查
+                    raise RuntimeError("infer() 返回空文本")
+                # 方便抽查
+                print(pred_text[:120].replace("\n", " "))
                 rec = {"image": img.name, "pred": pred_text}
-
             except Exception as e:
                 import traceback
                 print(f"处理图像 {img.name} 时出错: {e}")
